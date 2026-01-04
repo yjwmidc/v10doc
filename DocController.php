@@ -5,6 +5,7 @@ use think\facade\Config;
 use think\Request;
 use app\admin\controller\BaseController;
 use think\facade\View;
+use think\facade\Cache;
 
 class DocController extends BaseController
 {
@@ -40,6 +41,16 @@ class DocController extends BaseController
 
     public $static_path = '/doc/';
 
+    /**
+     * 缓存过期时间（秒）
+     */
+    protected $cacheExpire = 3600; // 1小时
+
+    /**
+     * 缓存标签
+     */
+    protected $cacheTag = 'apidoc';
+
     public function __construct(Request $request){
 
         $this->doc = new Doc((array)Config::get('doc'));
@@ -52,6 +63,9 @@ class DocController extends BaseController
         }
         View::assign('static', $this->static_path);
         $this->request = $request;
+        
+        // 从配置读取缓存过期时间
+        $this->cacheExpire = Config::get('doc.cache_expire', 3600);
     }
 
     /**
@@ -75,15 +89,33 @@ class DocController extends BaseController
     {
         if($this->request->isAjax())
         {
-            $data = $this->doc->searchList($this->request->get('query'));
-            return response($data, 200);
+            $query = $this->request->get('query', '');
+            $cacheKey = 'doc_search_' . md5($query);
+            
+            // 尝试从缓存获取
+            $data = Cache::get($cacheKey);
+            if ($data === false || $data === null) {
+                $data = $this->doc->searchList($query);
+                // 缓存搜索结果，使用标签
+                Cache::tag($this->cacheTag)->set($cacheKey, $data, $this->cacheExpire);
+            }
+            
+            return json($data);
         }
         else
         {
             if($this->checkLogin() == false){
                 return redirect('pass');
             }
-            $module = $this->doc->getModuleList();
+            
+            // 缓存模块列表
+            $cacheKey = 'doc_module_list';
+            $module = Cache::get($cacheKey);
+            if ($module === false || $module === null) {
+                $module = $this->doc->getModuleList();
+                Cache::tag($this->cacheTag)->set($cacheKey, $module, $this->cacheExpire);
+            }
+            
             View::assign('root', $this->request->root());
             return view('search', ['module' => $module]);
         }
@@ -117,9 +149,20 @@ class DocController extends BaseController
      */
     public function getList()
     {
-        $list = $this->doc->getList();
-        $list = $this->setIcon($list);
-        return response(['firstId'=>'', 'list'=>$list], 200, [], 'json');
+        $cacheKey = 'doc_list';
+        
+        // 尝试从缓存获取
+        $result = Cache::get($cacheKey);
+        if ($result === false || $result === null) {
+            $list = $this->doc->getList();
+            $list = $this->setIcon($list);
+            $result = ['firstId'=>'', 'list'=>$list];
+            
+            // 缓存列表数据，使用标签
+            Cache::tag($this->cacheTag)->set($cacheKey, $result, $this->cacheExpire);
+        }
+        
+        return response($result, 200, [], 'json');
     }
 
     /**
@@ -131,13 +174,30 @@ class DocController extends BaseController
         if($this->checkLogin() == false){
             return redirect('pass');
         }
-        list($class, $action) = explode("::", $this->request->get('name'));
+        
+        $name = $this->request->get('name');
+        if(empty($name)){
+            return view('info', ['doc'=>[], 'return'=>[], 'curl_code' => '']);
+        }
+        
+        $cacheKey = 'doc_info_' . md5($name);
+        
+        // 尝试从缓存获取
+        $cachedData = Cache::get($cacheKey);
+        if ($cachedData !== false && $cachedData !== null) {
+            View::assign('root', $this->request->root());
+            return view('info', $cachedData);
+        }
+        
+        list($class, $action) = explode("::", $name);
         $action_doc = $this->doc->getInfo($class, $action);
+        
         if($action_doc)
         {
             $return = $this->doc->formatReturn($action_doc);
             $action_doc['header'] = isset($action_doc['header']) ? array_merge($this->doc->__get('public_header'), $action_doc['header']) : [];
             $action_doc['param'] = isset($action_doc['param']) ? array_merge($this->doc->__get('public_param'), $action_doc['param']) : [];
+            
             //curl code
             $curl_code = 'curl --location --request '.($action_doc['method'] ?? 'GET');
             $params = [];
@@ -148,8 +208,14 @@ class DocController extends BaseController
             foreach ($action_doc['header'] as $header){
                 $curl_code .= '--header \''.$header['name'].':\'';
             }
+            
+            $viewData = ['doc'=>$action_doc, 'return'=>$return, 'curl_code' => $curl_code];
+            
+            // 缓存接口详情，使用标签
+            Cache::tag($this->cacheTag)->set($cacheKey, $viewData, $this->cacheExpire);
+            
             View::assign('root', $this->request->root());
-            return view('info', ['doc'=>$action_doc, 'return'=>$return, 'curl_code' => $curl_code]);
+            return view('info', $viewData);
         }
     }
 
@@ -206,24 +272,27 @@ class DocController extends BaseController
     public function debug()
     {
         $data = $this->request->all();
-        $api_url = $this->request->input('url');
+        $api_url = $this->request->param('url');
         $res['status'] = '404';
-        $res['meaasge'] = '接口地址无法访问！';
+        $res['message'] = '接口地址无法访问！';
         $res['result'] = '';
-        $method =  $this->request->input('method_type', 'GET');
-        $cookie = $this->request->input('cookie');
-        $headers = $this->request->input('header', array());
+        $method = $this->request->param('method_type', 'GET');
+        $cookie = $this->request->param('cookie');
+        $headers = $this->request->param('header', []);
+        
         unset($data['method_type']);
         unset($data['url']);
         unset($data['cookie']);
         unset($data['header']);
+        
         $res['result'] = $this->http_request($api_url, $cookie, $data, $method, $headers);
         if($res['result']){
             $res['status'] = '200';
-            $res['meaasge'] = 'success';
+            $res['message'] = 'success';
         }
         return response($res, 200, [], 'json');
     }
+
     /**
      * curl模拟请求方法
      * @param $url
@@ -274,5 +343,46 @@ class DocController extends BaseController
         curl_close($curl);
         return $output;
     }
-
+    
+    /**
+     * 清除所有文档缓存
+     * @return \think\Response
+     */
+    public function clearCache()
+    {
+        if($this->checkLogin() == false){
+            return json(['status' => '403', 'message' => '未授权']);
+        }
+        
+        try {
+            // 使用标签清除所有文档相关缓存
+            Cache::tag($this->cacheTag)->clear();
+            
+            return json(['status' => '200', 'message' => '缓存清除成功']);
+        } catch (\Exception $e) {
+            return json(['status' => '500', 'message' => '缓存清除失败：' . $e->getMessage()]);
+        }
+    }
+    
+    /**
+     * 获取缓存统计信息
+     * @return \think\Response
+     */
+    public function cacheStats()
+    {
+        if($this->checkLogin() == false){
+            return json(['status' => '403', 'message' => '未授权']);
+        }
+        
+        $stats = [
+            'cache_expire' => $this->cacheExpire,
+            'cache_tag' => $this->cacheTag,
+            'cached_keys' => [
+                'doc_list' => Cache::has('doc_list') ? '已缓存' : '未缓存',
+                'doc_module_list' => Cache::has('doc_module_list') ? '已缓存' : '未缓存',
+            ]
+        ];
+        
+        return json(['status' => '200', 'data' => $stats]);
+    }
 }
