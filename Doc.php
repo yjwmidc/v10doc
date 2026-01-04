@@ -7,7 +7,7 @@ class Doc
     protected  $config = [
         'title'=>'APi接口文档',
         'version'=>'1.0.0',
-        'copyright'=>'Powered By Zhangweiwei',
+        'copyright'=>'Powered By yjwmidc',
         'controller' => [],
         'filter_method'=>['_empty'],
         'return_format' => [
